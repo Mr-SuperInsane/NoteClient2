@@ -71,6 +71,7 @@ playwright install
 ```python
 from NoteClient2 import NoteClient2
 from dotenv import load_dotenv
+import os
 
 load_dotenv()
 
@@ -95,10 +96,7 @@ result = client.publish(
     is_publish=True
 )
 
-if result["success"]:
-    print("投稿成功:", result["url"])
-else:
-    print("エラー:", result["error"])
+print(result)
 ```
 
 ## Markdown による記事の書き方
