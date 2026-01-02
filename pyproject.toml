@@ -1,6 +1,6 @@
 [project]
 name = "NoteClient2"
-version = "1.0.1"
+version = "1.0.2"
 description = "Unofficial Python client for posting articles to note.com"
 keywords = ["note", "automation", "blog", "markdown", "playwright"]
 authors = [{ name="INSANE", email="support@nao-kun.com" }]
