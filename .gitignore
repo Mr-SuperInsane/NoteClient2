@@ -3,3 +3,7 @@ venv/*
 session.json
 __pycache__/
 *.pyc
+dist/
+build/
+*.egg-info/
+.eggs/
