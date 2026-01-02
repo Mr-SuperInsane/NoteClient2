@@ -1,0 +1,893 @@
+NoteClient2/
+__init__.py
+```
+from .client import NoteClient2
+
+__all__ = ["NoteClient2"]
+__version__ = "1.0.0"
+```
+
+auth.py
+```
+from __future__ import annotations
+
+import os
+import json
+from datetime import datetime
+from time import sleep
+from typing import Any, Dict, Optional
+
+from playwright.sync_api import Playwright, sync_playwright, expect
+
+from .http import HttpClient
+
+class AuthManager:
+    def __init__(self, email: str, password: str, session_file: str, headers: Dict[str, str]):
+        self.email = email
+        self.password = password
+        self.session_file = session_file
+        self.headers = dict(headers)
+        self.cookies: Dict[str, str] = {}
+
+    def load_session(self) -> Dict[str, Any]:
+        if not os.path.exists(self.session_file):
+            return {"ok": False, "error": {"type": "SessionNotFound", "message": "session file not found"}}
+        try:
+            with open(self.session_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return {"ok": True, "data": data}
+        except Exception as e:
+            return {"ok": False, "error": {"type": type(e).__name__, "message": str(e)}}
+
+    def save_session(self) -> Dict[str, Any]:
+        try:
+            data = {"timestamp": datetime.now().isoformat(), "cookies": self.cookies}
+            with open(self.session_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            return {"ok": True, "data": {"path": self.session_file}}
+        except Exception as e:
+            return {"ok": False, "error": {"type": type(e).__name__, "message": str(e)}}
+
+    def validate_session(self, http: HttpClient) -> Dict[str, Any]:
+        if not self.cookies:
+            return {"ok": False, "error": {"type": "NoCookies", "message": "cookies not set"}}
+        url = "https://note.com/api/v3/users/user_features"
+        resp = http.get(url)
+        if resp.get("ok"):
+            return {"ok": True}
+        return {
+            "ok": False,
+            "error": {
+                "type": "SessionInvalid",
+                "message": "session invalid",
+                "status_code": resp.get("status_code"),
+                "detail": resp.get("text"),
+            },
+        }
+
+    def prepare(self, http: HttpClient) -> Dict[str, Any]:
+        # 1) session.json があれば使う
+        session = self.load_session()
+        if session.get("ok"):
+            data = session["data"]
+            cookies = data.get("cookies") or {}
+            self.cookies = cookies
+            http.set_cookies(self.cookies)
+
+            valid = self.validate_session(http)
+            if valid.get("ok"):
+                return {"ok": True, "data": {"auth": "session"}}
+
+            # 期限などの情報を返す（ログ出しせず、戻り値へ）
+            ts = data.get("timestamp")
+            hours = None
+            if ts:
+                try:
+                    saved_time = datetime.fromisoformat(ts)
+                    hours = (datetime.now() - saved_time).total_seconds() / 3600
+                except Exception:
+                    hours = None
+
+            # セッション無効なら再ログインへ
+            relogin = self._get_cookies()
+            if not relogin.get("ok"):
+                relogin["error"]["session_hours"] = hours
+                return relogin
+
+            http.set_cookies(self.cookies)
+            self.save_session()
+            return {"ok": True, "data": {"auth": "relogin", "session_hours": hours}}
+
+        # 2) session が無い / 読めない -> ログイン
+        relogin = self._get_cookies()
+        if not relogin.get("ok"):
+            return relogin
+
+        http.set_cookies(self.cookies)
+        self.save_session()
+        return {"ok": True, "data": {"auth": "login"}}
+
+    def _login(self, playwright: Playwright, email_username: str, password: str) -> Any:
+        browser = playwright.chromium.launch(headless=True)
+        context = browser.new_context()
+        page = context.new_page()
+
+        page.goto("https://note.com/login?redirectPath=https%3A%2F%2Fnote.com%2F")
+        page.wait_for_load_state("domcontentloaded")
+        sleep(2)
+
+        email_box = page.get_by_role("textbox", name="mail@example.com or note ID")
+        email_box.click()
+        email_box.fill(email_username)
+
+        try:
+            expect(email_box).to_have_value(email_username, timeout=3000)
+        except Exception:
+            email_box.fill("")
+            email_box.fill(email_username)
+            try:
+                expect(email_box).to_have_value(email_username)
+            except Exception:
+                pass
+
+        password_box = page.get_by_role("textbox", name="パスワード")
+        password_box.click()
+        password_box.fill(password)
+
+        page.get_by_role("button", name="ログイン").click()
+        page.wait_for_load_state("networkidle")
+
+        cookies = context.cookies()
+
+        page.close()
+        context.close()
+        browser.close()
+
+        return cookies
+
+    def _get_cookies(self) -> Dict[str, Any]:
+        try:
+            with sync_playwright() as playwright:
+                raw = self._login(playwright, self.email, self.password)
+                self.cookies = {c["name"]: c["value"] for c in raw}
+            return {"ok": True, "data": {"cookies": list(self.cookies.keys())}}
+        except Exception as e:
+            return {"ok": False, "error": {"type": type(e).__name__, "message": str(e), "where": "playwright_login"}}
+```
+
+client.py
+```
+from __future__ import annotations
+import re
+from typing import Any, Dict, List, Optional, Union
+
+from .http import HttpClient
+from .auth import AuthManager
+from .images import ImageManager
+from .magazines import MagazineResolver
+from .markdown_parser import MarkdownParser
+from .utils import xsrf_from_cookies
+
+class NoteClient2:
+    def __init__(self, email: str, password: str, user_urlname: str, session_file: str = "session.json"):
+        self.email = email
+        self.password = password
+        self.user_urlname = user_urlname
+
+        self.cookies: Dict[str, str] = {}
+        self.headers: Dict[str, str] = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Origin": "https://editor.note.com",
+            "X-Requested-With": "XMLHttpRequest",
+        }
+
+        self.http = HttpClient(self.headers, self.cookies)
+        self.auth = AuthManager(email, password, session_file, self.headers)
+        self.images = ImageManager()
+        self.magazines = MagazineResolver()
+        self.parser = MarkdownParser(self.images)
+
+    def _sync_cookies(self) -> None:
+        self.cookies = dict(self.auth.cookies)
+        self.http.set_cookies(self.cookies)
+
+    def _draft_save(self, note_id: int, title: str, body_html: str, image_keys: List[str]) -> Dict[str, Any]:
+        xsrf = xsrf_from_cookies(self.cookies)
+        url = f"https://note.com/api/v1/text_notes/draft_save?id={note_id}&is_temp_saved=true"
+
+        headers = {
+            "X-XSRF-TOKEN": xsrf,
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": "https://editor.note.com/",
+            "Content-Type": "application/json",
+        }
+
+        plain_text = re.sub(r"<[^>]+>", "", body_html)
+        body_length = len(plain_text)
+
+        payload = {
+            "body": body_html,
+            "body_length": body_length,
+            "name": title,
+            "index": False,
+            "is_lead_form": False,
+            "image_keys": image_keys or [],
+        }
+
+        resp = self.http.post(url, headers=headers, json=payload)
+        if not resp.get("ok"):
+            return {"ok": False, "error": {"type": "DraftSaveFailed", "status_code": resp.get("status_code"), "detail": resp.get("text")}}
+        return {"ok": True}
+
+    def publish(
+        self,
+        title: str,
+        md_file_path: str,
+        eyecatch_path: Optional[str] = None,
+        hashtags: Optional[List[str]] = None,
+        price: int = 0,
+        magazine_key: Optional[List[str]] = None,
+        is_publish: bool = False,
+    ) -> Dict[str, Any]:
+        hashtags = hashtags or []
+        magazine_key = magazine_key or []
+
+        # 1) Auth
+        auth_result = self.auth.prepare(self.http)
+        if not auth_result.get("ok"):
+            return auth_result
+        self._sync_cookies()
+
+        # 2) Parse markdown (upload images inside)
+        parsed = self.parser.parse(self.http, self.headers, md_file_path)
+        if not parsed.get("ok"):
+            return parsed
+
+        data = parsed["data"]
+        free_html = data["free_html"]
+        pay_html = data["pay_html"]
+        combined_html = data["combined_html"]
+        image_keys = data["image_keys"]
+        separator_id = data["separator_id"]
+
+        # 3) Resolve magazines
+        magazine_id_list: List[int] = []
+        for key in magazine_key:
+            r = self.magazines.get_magazine_id(self.http, self.user_urlname, self.headers, key)
+            if not r.get("ok"):
+                return r
+            mid = (r.get("data") or {}).get("magazine_id")
+            if mid:
+                magazine_id_list.append(mid)
+
+        # 4) Create note skeleton
+        created = self.http.post(
+            "https://note.com/api/v1/text_notes",
+            headers=self.headers,
+            json={"template_key": None},
+        )
+        if not created.get("ok") or not created.get("json"):
+            return {"ok": False, "error": {"type": "CreateNoteFailed", "status_code": created.get("status_code"), "detail": created.get("text")}}
+
+        note_data = (created["json"] or {}).get("data")
+        if not note_data:
+            return {"ok": False, "error": {"type": "CreateNoteInvalidResponse", "detail": created.get("json")}}
+
+        note_id = note_data.get("id")
+        note_key = note_data.get("key")
+        if not note_id or not note_key:
+            return {"ok": False, "error": {"type": "CreateNoteMissingFields", "detail": note_data}}
+
+        # 5) Eyecatch
+        if eyecatch_path:
+            eye = self.images.upload_eyecatch(self.http, self.headers, note_id, eyecatch_path)
+            if not eye.get("ok"):
+                return eye
+
+        # 6) Draft only
+        if not is_publish:
+            draft = self._draft_save(note_id, title, combined_html, image_keys)
+            if not draft.get("ok"):
+                return draft
+            return {
+                "ok": True,
+                "data": {
+                    "mode": "draft",
+                    "note_id": note_id,
+                    "note_key": note_key,
+                    "edit_url": f"https://editor.note.com/notes/{note_key}/edit",
+                },
+            }
+
+        # 7) Temp save (draft_save)
+        temp = self.http.post(
+            f"https://note.com/api/v1/text_notes/draft_save?id={note_id}&is_temp_saved=true",
+            headers=self.headers,
+            json={"body": combined_html, "name": title, "index": True},
+        )
+        if not temp.get("ok"):
+            return {"ok": False, "error": {"type": "TempDraftSaveFailed", "status_code": temp.get("status_code"), "detail": temp.get("text")}}
+
+        # 8) Final PUT
+        status_str = "published"
+        formatted_hashtags = [t if t.startswith("#") else f"#{t}" for t in hashtags]
+        body_len = len(re.sub(r"<[^>]+>", "", combined_html))
+
+        overrides = {
+            "name": title,
+            "free_body": free_html,
+            "pay_body": pay_html if price > 0 else "",
+            "status": status_str,
+            "price": price,
+            "separator": separator_id if price > 0 and separator_id else None,
+            "is_refund": False,
+            "limited": False,
+            "index": True,
+            "image_keys": image_keys,
+            "hashtags": formatted_hashtags,
+            "magazine_ids": magazine_id_list,
+            "magazine_keys": [],
+            "body_length": body_len,
+            "send_notifications_flag": True,
+            "lead_form": {"is_active": False, "consent_url": ""},
+            "line_add_friend": {"is_active": False, "keyword": "", "add_friend_url": ""},
+        }
+
+        update_payload = dict(note_data)
+        update_payload.update(overrides)
+        payload = {k: v for k, v in update_payload.items() if v is not None}
+
+        put = self.http.put(
+            f"https://note.com/api/v1/text_notes/{note_id}",
+            headers=self.headers,
+            json=payload,
+        )
+        if not put.get("ok"):
+            return {"ok": False, "error": {"type": "PublishFailed", "status_code": put.get("status_code"), "detail": put.get("text")}}
+
+        return {
+            "ok": True,
+            "data": {
+                "mode": "published",
+                "note_id": note_id,
+                "note_key": note_key,
+                "public_url": f"https://note.com/{self.user_urlname}/n/{note_key}",
+                "edit_url": f"https://editor.note.com/notes/{note_key}/edit",
+                "has_pay": price > 0,
+            },
+        }
+```
+
+http.py
+```
+from __future__ import annotations
+import requests
+from typing import Any, Dict, Optional
+
+class HttpClient:
+    def __init__(self, base_headers: Dict[str, str], cookies: Dict[str, str]):
+        self.base_headers = dict(base_headers)
+        self.cookies = cookies
+
+    def set_cookies(self, cookies: Dict[str, str]) -> None:
+        self.cookies = cookies
+
+    def get(self, url: str, headers: Optional[Dict[str, str]] = None, **kwargs) -> Dict[str, Any]:
+        try:
+            resp = requests.get(url, headers={**self.base_headers, **(headers or {})}, cookies=self.cookies, **kwargs)
+            return {
+                "ok": resp.status_code == 200,
+                "status_code": resp.status_code,
+                "text": resp.text,
+                "json": self._safe_json(resp),
+            }
+        except Exception as e:
+            return {"ok": False, "error": {"type": type(e).__name__, "message": str(e), "where": "GET", "url": url}}
+
+    def post(self, url: str, headers: Optional[Dict[str, str]] = None, **kwargs) -> Dict[str, Any]:
+        try:
+            resp = requests.post(url, headers={**self.base_headers, **(headers or {})}, cookies=self.cookies, **kwargs)
+            ok = resp.status_code in (200, 201)
+            return {
+                "ok": ok,
+                "status_code": resp.status_code,
+                "text": resp.text,
+                "json": self._safe_json(resp),
+            }
+        except Exception as e:
+            return {"ok": False, "error": {"type": type(e).__name__, "message": str(e), "where": "POST", "url": url}}
+
+    def put(self, url: str, headers: Optional[Dict[str, str]] = None, **kwargs) -> Dict[str, Any]:
+        try:
+            resp = requests.put(url, headers={**self.base_headers, **(headers or {})}, cookies=self.cookies, **kwargs)
+            ok = resp.status_code in (200, 201)
+            return {
+                "ok": ok,
+                "status_code": resp.status_code,
+                "text": resp.text,
+                "json": self._safe_json(resp),
+            }
+        except Exception as e:
+            return {"ok": False, "error": {"type": type(e).__name__, "message": str(e), "where": "PUT", "url": url}}
+
+    @staticmethod
+    def _safe_json(resp: requests.Response) -> Any:
+        try:
+            return resp.json()
+        except Exception:
+            return None
+        
+```
+
+images.py
+```
+from __future__ import annotations
+import os
+import mimetypes
+import uuid
+from typing import Any, Dict, Tuple, Optional
+
+from .http import HttpClient
+
+class ImageManager:
+    def __init__(self):
+        self.uploaded: Dict[str, Tuple[str, str]] = {}  # file_path -> (url, path)
+
+    def upload_image(self, http: HttpClient, headers: Dict[str, str], file_path: str) -> Dict[str, Any]:
+        if file_path in self.uploaded:
+            url, key = self.uploaded[file_path]
+            return {"ok": True, "data": {"url": url, "path": key, "cached": True}}
+
+        if not os.path.exists(file_path):
+            return {"ok": False, "error": {"type": "FileNotFound", "message": "image not found", "path": file_path}}
+
+        ext = os.path.splitext(file_path)[1] or ".png"
+        uuid_name = f"{uuid.uuid4().hex}{ext}"
+        mime = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
+
+        presign = http.post(
+            "https://note.com/api/v3/images/upload/presigned_post",
+            headers=headers,
+            files={"filename": (None, uuid_name)},
+        )
+        if not presign.get("ok") or not presign.get("json"):
+            return {"ok": False, "error": {"type": "PresignFailed", "status_code": presign.get("status_code"), "detail": presign.get("text")}}
+
+        data = (presign["json"] or {}).get("data") or {}
+        if "action" not in data:
+            return {"ok": False, "error": {"type": "PresignInvalid", "message": "missing action", "detail": data}}
+
+        try:
+            with open(file_path, "rb") as f:
+                up = http.post(
+                    data["action"],
+                    headers={},  # S3 へは base headers を使いたくないので空
+                    data=data.get("post"),
+                    files={"file": (uuid_name, f, mime)},
+                )
+            if not up.get("ok"):
+                return {"ok": False, "error": {"type": "S3UploadFailed", "status_code": up.get("status_code"), "detail": up.get("text")}}
+        except Exception as e:
+            return {"ok": False, "error": {"type": type(e).__name__, "message": str(e), "where": "open/upload"}}
+
+        result = (data.get("url"), data.get("path"))
+        if not result[0] or not result[1]:
+            return {"ok": False, "error": {"type": "UploadResultInvalid", "detail": data}}
+
+        self.uploaded[file_path] = result
+        return {"ok": True, "data": {"url": result[0], "path": result[1], "cached": False}}
+
+    def upload_eyecatch(self, http: HttpClient, headers: Dict[str, str], note_id: int, file_path: str) -> Dict[str, Any]:
+        if not file_path:
+            return {"ok": True, "data": {"skipped": True}}
+        if not os.path.exists(file_path):
+            return {"ok": False, "error": {"type": "FileNotFound", "message": "eyecatch not found", "path": file_path}}
+
+        try:
+            with open(file_path, "rb") as f:
+                files = {"file": ("blob", f, "image/png")}
+                data = {"note_id": note_id, "width": 1920, "height": 1080}
+                resp = http.post(
+                    "https://note.com/api/v1/image_upload/note_eyecatch",
+                    headers=headers,
+                    files=files,
+                    data=data,
+                )
+            if not resp.get("ok"):
+                return {"ok": False, "error": {"type": "EyecatchUploadFailed", "status_code": resp.get("status_code"), "detail": resp.get("text")}}
+            return {"ok": True, "data": {"uploaded": True}}
+        except Exception as e:
+            return {"ok": False, "error": {"type": type(e).__name__, "message": str(e), "where": "upload_eyecatch"}}
+```
+
+magazines.py
+```
+from __future__ import annotations
+import re
+from typing import Any, Dict, Optional
+
+from .http import HttpClient
+
+class MagazineResolver:
+    def get_magazine_id(self, http: HttpClient, user_urlname: str, headers: Dict[str, str], magazine_key: str) -> Dict[str, Any]:
+        if not magazine_key:
+            return {"ok": True, "data": {"magazine_id": None}}
+
+        url = f"https://note.com/{user_urlname}/m/{magazine_key}"
+        res = http.get(url, headers={"User-Agent": headers.get("User-Agent", "")})
+        if not res.get("ok"):
+            return {"ok": False, "error": {"type": "MagazinePageFetchFailed", "status_code": res.get("status_code"), "detail": res.get("text"), "url": url}}
+
+        html = res.get("text") or ""
+
+        m = re.search(r"magazineLayout\s*:\s*{\s*id\s*:\s*(\d+)", html)
+        if m:
+            return {"ok": True, "data": {"magazine_id": int(m.group(1))}}
+
+        m2 = re.search(r'"magazineLayout"\s*:\s*{\s*"id"\s*:\s*(\d+)', html)
+        if m2:
+            return {"ok": True, "data": {"magazine_id": int(m2.group(1))}}
+
+        return {"ok": False, "error": {"type": "MagazineIdNotFound", "message": "magazine id not found in html", "url": url}}
+
+```
+
+markdown_parser.py
+```
+from __future__ import annotations
+import os
+import re
+from typing import Any, Dict, List, Tuple, Optional
+
+from .utils import gen_uuid
+from .http import HttpClient
+from .images import ImageManager
+
+class MarkdownParser:
+    def __init__(self, image_manager: ImageManager):
+        self.image_manager = image_manager
+        self.img_pattern = re.compile(r'!\[(.*?)\]\((.*?)\)')
+
+    def _parse_inline(self, text: str) -> str:
+        text = re.sub(r'\[(.*?)\]\((.*?)\)', r'<a href="\2">\1</a>', text)
+        text = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', text)
+        text = re.sub(r'\*(.+?)\*', r'<em>\1</em>', text)
+        text = re.sub(r'~~(.+?)~~', r'<s>\1</s>', text)
+        return text
+
+    def _build_list_html(self, buffer: List[Dict[str, Any]]) -> Tuple[str, Optional[str]]:
+        if not buffer:
+            return "", None
+
+        html_output: List[str] = []
+        first = buffer[0]
+        is_ordered_root = bool(re.match(r'^\d+\.', first['marker']))
+        root_type = 'ol' if is_ordered_root else 'ul'
+
+        root_uid = gen_uuid()
+        if root_type == 'ol':
+            html_output.append(f'<{root_type} data-start="1" name="{root_uid}" id="{root_uid}">')
+        else:
+            html_output.append(f'<{root_type} name="{root_uid}" id="{root_uid}">')
+
+        tag_stack = [{'indent': first['indent'], 'type': root_type}]
+
+        for item in buffer:
+            indent = item['indent']
+            marker = item['marker']
+            content_text = item['clean_text']
+            content_inner = self._parse_inline(content_text)
+
+            p_uid = gen_uuid()
+            list_content = f'<p name="{p_uid}" id="{p_uid}">{content_inner}</p>'
+
+            current_item_type = 'ol' if re.match(r'^\d+\.', marker) else 'ul'
+            current_stack = tag_stack[-1]
+
+            if indent > current_stack['indent']:
+                new_uid = gen_uuid()
+                if current_item_type == 'ol':
+                    html_output.append(f'<{current_item_type} data-start="1" name="{new_uid}" id="{new_uid}">')
+                else:
+                    html_output.append(f'<{current_item_type} name="{new_uid}" id="{new_uid}">')
+                tag_stack.append({'indent': indent, 'type': current_item_type})
+
+            elif indent < current_stack['indent']:
+                while tag_stack and tag_stack[-1]['indent'] > indent:
+                    closed = tag_stack.pop()
+                    html_output.append(f"</{closed['type']}>")
+
+            else:
+                if current_item_type != current_stack['type']:
+                    html_output.append(f"</{current_stack['type']}>")
+                    tag_stack.pop()
+                    new_uid = gen_uuid()
+                    if current_item_type == 'ol':
+                        html_output.append(f'<{current_item_type} data-start="1" name="{new_uid}" id="{new_uid}">')
+                    else:
+                        html_output.append(f'<{current_item_type} name="{new_uid}" id="{new_uid}">')
+                    tag_stack.append({'indent': indent, 'type': current_item_type})
+
+            html_output.append(f'<li>{list_content}</li>')
+
+        while tag_stack:
+            closed = tag_stack.pop()
+            html_output.append(f"</{closed['type']}>")
+
+        return "".join(html_output), root_uid
+
+    def parse(self, http: HttpClient, headers: Dict[str, str], md_path: str) -> Dict[str, Any]:
+        if not os.path.exists(md_path):
+            return {"ok": False, "error": {"type": "FileNotFound", "message": "md not found", "path": md_path}}
+
+        try:
+            with open(md_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+        except Exception as e:
+            return {"ok": False, "error": {"type": type(e).__name__, "message": str(e), "where": "read_md"}}
+
+        free_parts: List[str] = []
+        pay_parts: List[str] = []
+        current_parts = free_parts
+
+        image_keys: List[str] = []
+        separator_id: Optional[str] = None
+        last_block_id: Optional[str] = None
+
+        in_code_block = False
+        list_buffer: List[Dict[str, Any]] = []
+        pay_tag_count = 0
+
+        def flush_list_buffer():
+            nonlocal list_buffer, last_block_id
+            if list_buffer:
+                l_html, l_uid = self._build_list_html(list_buffer)
+                current_parts.append(l_html)
+                last_block_id = l_uid
+                list_buffer = []
+
+        def build_html(parts: List[str]) -> str:
+            final = ""
+            is_in_code = False
+            for part in parts:
+                if "<pre" in part:
+                    is_in_code = True
+                final += (part + "\n") if is_in_code else part
+                if "</pre>" in part:
+                    is_in_code = False
+            return final
+
+        for line in lines:
+            raw_line = line.rstrip("\r\n")
+            stripped = raw_line.strip()
+            lower = stripped.lower()
+
+            if "</pay>" in lower:
+                return {"ok": False, "error": {"type": "InvalidPayTag", "message": "</pay> is not allowed"}}
+
+            if stripped.startswith("```"):
+                flush_list_buffer()
+                if not in_code_block:
+                    in_code_block = True
+                    uid = gen_uuid()
+                    lang = stripped.lstrip("`").strip()
+                    current_parts.append(f'<pre name="{uid}" id="{uid}" data-lang="{lang}"><code>')
+                    last_block_id = uid
+                else:
+                    in_code_block = False
+                    current_parts.append("</code></pre>")
+                continue
+
+            if in_code_block:
+                current_parts.append(raw_line)
+                continue
+
+            if not stripped:
+                flush_list_buffer()
+                continue
+
+            list_match = re.match(r'^(\s*)([-*]|\d+\.)\s+(.*)', raw_line)
+            if list_match:
+                list_buffer.append({
+                    "indent": len(list_match.group(1)),
+                    "marker": list_match.group(2),
+                    "clean_text": list_match.group(3),
+                })
+                continue
+            else:
+                flush_list_buffer()
+
+            if "<toc>" in lower or "<table of content>" in lower:
+                uid = gen_uuid()
+                head_uid = gen_uuid()
+                current_parts.append(f'<h2 name="{head_uid}" id="{head_uid}">目次</h2>')
+                current_parts.append(f'<table-of-contents name="{uid}" id="{uid}"><br></table-of-contents>')
+                last_block_id = uid
+                continue
+
+            if "<pay>" in lower or "<pay_line>" in lower:
+                if lower != "<pay>":
+                    return {"ok": False, "error": {"type": "InvalidPayTag", "message": "<pay> must be on its own line"}}
+                if pay_tag_count >= 1:
+                    return {"ok": False, "error": {"type": "InvalidPayTag", "message": "<pay> allowed only once"}}
+
+                pay_tag_count += 1
+                if last_block_id:
+                    separator_id = last_block_id
+
+                current_parts = pay_parts
+                sep_uid = gen_uuid()
+                current_parts.append(f'<span name="{sep_uid}" id="{sep_uid}"></span>')
+                last_block_id = sep_uid
+                continue
+
+            img_match = self.img_pattern.search(stripped)
+            if img_match:
+                img_path = img_match.group(2)
+                up = self.image_manager.upload_image(http, headers, img_path)
+                if not up.get("ok"):
+                    up["error"]["where"] = "markdown_image_upload"
+                    up["error"]["md_path"] = md_path
+                    up["error"]["image_path"] = img_path
+                    return up
+
+                img_url = up["data"]["url"]
+                img_key_full = up["data"]["path"]
+
+                uid = gen_uuid()
+                current_parts.append(
+                    f'<figure name="{uid}" id="{uid}" class="note-image" data-image-key="{img_key_full}">'
+                    f'<a href="{img_url}" rel="noopener noreferrer" target="_blank">'
+                    f'<img src="{img_url}" alt="画像" data-src="{img_url}"></a>'
+                    f'<figcaption>{img_match.group(1)}</figcaption></figure>'
+                )
+                pure_key = os.path.splitext(os.path.basename(img_key_full))[0]
+                image_keys.append(pure_key)
+                last_block_id = uid
+                continue
+
+            uid = gen_uuid()
+            line_content = self._parse_inline(stripped)
+
+            if stripped.startswith("### "):
+                current_parts.append(f'<h3 name="{uid}" id="{uid}">{line_content.lstrip("# ").strip()}</h3>')
+            elif stripped.startswith("# ") or stripped.startswith("## "):
+                current_parts.append(f'<h2 name="{uid}" id="{uid}">{line_content.lstrip("# ").strip()}</h2>')
+            elif stripped.startswith("> "):
+                current_parts.append(f'<blockquote name="{uid}" id="{uid}">{line_content.lstrip("> ").strip()}</blockquote>')
+            elif stripped.startswith("---") or stripped.startswith("***"):
+                current_parts.append(f'<hr name="{uid}" id="{uid}">')
+            else:
+                current_parts.append(f'<p name="{uid}" id="{uid}">{line_content}</p>')
+
+            last_block_id = uid
+
+        flush_list_buffer()
+
+        free_html = build_html(free_parts)
+        pay_html = build_html(pay_parts)
+
+        return {
+            "ok": True,
+            "data": {
+                "free_html": free_html,
+                "pay_html": pay_html,
+                "combined_html": free_html + pay_html,
+                "image_keys": image_keys,
+                "separator_id": separator_id,
+                "has_pay": pay_tag_count == 1,
+            },
+        }
+
+```
+
+utils.py
+```
+import uuid
+import urllib.parse
+from typing import Dict
+
+
+def gen_uuid() -> str:
+    """
+    note の body / free_body / pay_body で使う
+    name / id 用の UUID を生成する
+
+    - 全モジュールで共通仕様
+    """
+    return str(uuid.uuid4())
+
+
+def xsrf_from_cookies(cookies: Dict[str, str]) -> str:
+    """
+    Cookie に含まれる XSRF-TOKEN を安全に取り出す
+
+    note の XSRF-TOKEN は URL エンコードされていることがあるため
+    必ず unquote して返す
+    """
+    token = cookies.get("XSRF-TOKEN", "")
+    if not token:
+        return ""
+    return urllib.parse.unquote(token)
+```
+
+.gitignore
+```
+venv/*
+.env
+session.json
+__pycache__/
+*.pyc
+```
+
+LICENSE
+```
+NoteClient2 License
+
+Copyright (c) 2026 INSANE
+
+All rights reserved.
+
+Permission is hereby granted to any individual to use and modify this software
+for personal and non-commercial purposes only, subject to the following conditions:
+
+1. Personal Use Only  
+   This software may be used for personal, educational, or experimental purposes.
+   Commercial use of this software, in whole or in part, is strictly prohibited.
+
+2. No Commercial Use  
+   You may NOT use this software for any commercial activity, including but not limited to:
+   - Selling services or products based on this software
+   - Using this software as part of a paid service or platform
+
+3. Modification Allowed  
+   You are permitted to modify the source code for your own personal use.
+   Modified versions may NOT be distributed, published, or shared.
+
+4. No Redistribution  
+   Copying, redistributing, sublicensing, or publishing this software,
+   either in its original form or in modified form, is strictly prohibited.
+
+5. Ownership and Copyright  
+   All rights, title, and interest in this software, including all intellectual property rights,
+   remain solely with the original author, INSANE.
+   This license does not grant any ownership rights to the user.
+
+6. No Warranty  
+   This software is provided "AS IS", without warranty of any kind, express or implied,
+   including but not limited to the warranties of merchantability,
+   fitness for a particular purpose, and non-infringement.
+   In no event shall the author be liable for any claim, damages, or other liability,
+   whether in an action of contract, tort, or otherwise, arising from,
+   out of, or in connection with the software or the use or other dealings in the software.
+
+By using this software, you agree to be bound by the terms of this license.
+```
+
+pyproject.toml
+```
+[project]
+name = "NoteClient2"
+version = "1.0.0"
+description = "Unofficial Python client for posting articles to note.com"
+authors = [{ name="INSANE", email="support@nao-kun.com" }]
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+
+dependencies = [
+  "requests",
+  "playwright",
+]
+
+[project.urls]
+Homepage = "https://github.com/Mr-SuperInsane/NoteClient2"
+```
+
+README.md
+```
+
+長文のため省略
+
+```
+
