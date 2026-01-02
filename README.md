@@ -1,4 +1,4 @@
-![](NoteClientHeader.png)
+![](https://raw.githubusercontent.com/Mr-SuperInsane/NoteClient2/refs/heads/main/NoteClientHeader.png)
 
 Python から **note に記事を投稿するための非公式ライブラリ**です。  
 Markdown で記述した記事を、画像・アイキャッチ・有料エリアを含めて投稿できます。
@@ -215,4 +215,4 @@ else:
 
 ## ライセンス
 
-[INSANE License](LICENSE)
+[INSANE License](https://github.com/Mr-SuperInsane/NoteClient2/blob/main/LICENSE)
