@@ -1,4 +1,62 @@
-![](image/NoteClientHeader.png)
+Metadata-Version: 2.4
+Name: NoteClient2
+Version: 1.0.0
+Summary: Unofficial Python client for posting articles to note.com
+Author-email: INSANE <support@nao-kun.com>
+License: NoteClient2 License
+        
+        Copyright (c) 2026 INSANE
+        
+        All rights reserved.
+        
+        Permission is hereby granted to any individual to use and modify this software
+        for personal and non-commercial purposes only, subject to the following conditions:
+        
+        1. Personal Use Only  
+           This software may be used for personal, educational, or experimental purposes.
+           Commercial use of this software, in whole or in part, is strictly prohibited.
+        
+        2. No Commercial Use  
+           You may NOT use this software for any commercial activity, including but not limited to:
+           - Selling services or products based on this software
+           - Using this software as part of a paid service or platform
+        
+        3. Modification Allowed  
+           You are permitted to modify the source code for your own personal use.
+           Modified versions may NOT be distributed, published, or shared.
+        
+        4. No Redistribution  
+           Copying, redistributing, sublicensing, or publishing this software,
+           either in its original form or in modified form, is strictly prohibited.
+        
+        5. Ownership and Copyright  
+           All rights, title, and interest in this software, including all intellectual property rights,
+           remain solely with the original author, INSANE.
+           This license does not grant any ownership rights to the user.
+        
+        6. No Warranty  
+           This software is provided "AS IS", without warranty of any kind, express or implied,
+           including but not limited to the warranties of merchantability,
+           fitness for a particular purpose, and non-infringement.
+           In no event shall the author be liable for any claim, damages, or other liability,
+           whether in an action of contract, tort, or otherwise, arising from,
+           out of, or in connection with the software or the use or other dealings in the software.
+        
+        By using this software, you agree to be bound by the terms of this license.
+Project-URL: Homepage, https://github.com/Mr-SuperInsane/NoteClient2
+Keywords: note,automation,blog,markdown,playwright
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3 :: Only
+Classifier: License :: Other/Proprietary License
+Classifier: Operating System :: OS Independent
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: requests
+Requires-Dist: playwright
+Dynamic: license-file
+
+# NoteClient2
 
 Python から **note に記事を投稿するための非公式ライブラリ**です。  
 Markdown で記述した記事を、画像・アイキャッチ・有料エリアを含めて投稿できます。
